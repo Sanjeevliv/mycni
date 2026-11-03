@@ -1,0 +1,25 @@
+# Binaries
+bin/
+*.o
+*.a
+*.so
+
+# Test artifacts
+cover.out
+coverage.html
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS artifacts
+.DS_Store
+
+# Temporary files
+*.tmp
+
+# Notes / Guides
+M1.md
+
