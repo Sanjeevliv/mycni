@@ -40,3 +40,8 @@ func EnableIPForward() error {
 func EnableBridgeNetfilter() error {
 	return nil
 }
+
+// EnsureMasquerade stub for non-linux systems.
+func EnsureMasquerade(podCIDR string, clusterCIDR string) error {
+	return nil
+}

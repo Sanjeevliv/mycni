@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"strings"
 
 	"github.com/containernetworking/plugins/pkg/ip"
 	"github.com/containernetworking/plugins/pkg/ns"
+	"github.com/coreos/go-iptables/iptables"
 	"github.com/vishvananda/netlink"
 )
 
@@ -219,10 +221,26 @@ func EnableIPForward() error {
 }
 
 // EnableBridgeNetfilter enables bridge-nf-call-iptables if available.
+// If the bridge netfilter sysctl does not exist yet, it tries modprobe br_netfilter.
 func EnableBridgeNetfilter() error {
 	path := "/proc/sys/net/bridge/bridge-nf-call-iptables"
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		// Attempt to load kernel module br_netfilter
+		_ = exec.Command("modprobe", "br_netfilter").Run()
+	}
 	if _, err := os.Stat(path); err == nil {
 		return os.WriteFile(path, []byte("1"), 0644)
 	}
 	return nil
+}
+
+// EnsureMasquerade ensures the iptables POSTROUTING MASQUERADE rule exists for outbound pod traffic.
+func EnsureMasquerade(podCIDR string, clusterCIDR string) error {
+	ipt, err := iptables.New()
+	if err != nil {
+		return fmt.Errorf("failed to initialize iptables: %w", err)
+	}
+
+	rule := []string{"-s", podCIDR, "!", "-d", clusterCIDR, "-j", "MASQUERADE"}
+	return ipt.AppendUnique("nat", "POSTROUTING", rule...)
 }
