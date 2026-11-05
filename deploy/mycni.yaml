@@ -1,0 +1,142 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mycni
+  namespace: kube-system
+  labels:
+    k8s-app: mycni
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mycni
+  labels:
+    k8s-app: mycni
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["nodes/status"]
+    verbs: ["patch", "update"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mycni
+  labels:
+    k8s-app: mycni
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: mycni
+subjects:
+  - kind: ServiceAccount
+    name: mycni
+    namespace: kube-system
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: mycni-agent
+  namespace: kube-system
+  labels:
+    k8s-app: mycni
+    app.kubernetes.io/name: mycni-agent
+    tier: node
+spec:
+  selector:
+    matchLabels:
+      k8s-app: mycni
+  template:
+    metadata:
+      labels:
+        k8s-app: mycni
+        app.kubernetes.io/name: mycni-agent
+        tier: node
+    spec:
+      serviceAccountName: mycni
+      hostNetwork: true
+      hostPID: true
+      priorityClassName: system-node-critical
+      tolerations:
+        - operator: Exists
+          effect: NoSchedule
+        - operator: Exists
+          effect: NoExecute
+        - key: CriticalAddonsOnly
+          operator: Exists
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: mycni-agent
+          image: mycni:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: CNI_BIN_SRC
+              value: "/bin/mycni-cni"
+            - name: CNI_BIN_DIR
+              value: "/host/opt/cni/bin"
+            - name: CNI_CONF_DIR
+              value: "/host/etc/cni/net.d"
+            - name: CNI_DATA_DIR
+              value: "/var/lib/cni/mycni"
+            - name: CLUSTER_CIDR
+              value: "10.244.0.0/16"
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "250m"
+              memory: "256Mi"
+          volumeMounts:
+            - name: cni-bin
+              mountPath: /host/opt/cni/bin
+            - name: cni-conf
+              mountPath: /host/etc/cni/net.d
+            - name: cni-data
+              mountPath: /var/lib/cni/mycni
+            - name: host-log
+              mountPath: /var/log
+            - name: xtables-lock
+              mountPath: /run/xtables.lock
+            - name: lib-modules
+              mountPath: /lib/modules
+              readOnly: true
+      volumes:
+        - name: cni-bin
+          hostPath:
+            path: /opt/cni/bin
+        - name: cni-conf
+          hostPath:
+            path: /etc/cni/net.d
+        - name: cni-data
+          hostPath:
+            path: /var/lib/cni/mycni
+        - name: host-log
+          hostPath:
+            path: /var/log
+        - name: xtables-lock
+          hostPath:
+            path: /run/xtables.lock
+            type: FileOrCreate
+        - name: lib-modules
+          hostPath:
+            path: /lib/modules
