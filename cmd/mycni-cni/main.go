@@ -53,13 +53,14 @@ func cmdAdd(args *skel.CmdArgs) error {
 		return err
 	}
 
-	// 2. Allocate pod IP
-	podIP, err := ipamInstance.Allocate(args.ContainerID, args.IfName)
+	// 2. Allocate pod IP with optional pod metadata from CNI_ARGS
+	podMeta := cni.ParseCNIArgs(args.Args)
+	podIP, err := ipamInstance.AllocateWithMetadata(args.ContainerID, args.IfName, podMeta.PodNamespace, podMeta.PodName)
 	if err != nil {
 		logger.Error("failed to allocate pod IP", "error", err)
 		return err
 	}
-	logger.Info("allocated IP for pod", "ip", podIP.String(), "containerID", args.ContainerID)
+	logger.Info("allocated IP for pod", "ip", podIP.String(), "containerID", args.ContainerID, "namespace", podMeta.PodNamespace, "pod", podMeta.PodName)
 
 	// 3. Setup veth interfaces
 	hostVeth, contMAC, err := netutil.SetupPodVeth(args.Netns, args.IfName, conf.MTU, bridge, podIP, ipamInstance.GetGatewayIP())

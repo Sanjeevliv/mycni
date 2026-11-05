@@ -182,3 +182,106 @@ func TestIPAMConcurrentAllocations(t *testing.T) {
 		t.Errorf("expected %d leases, got %d", concurrency, len(leases))
 	}
 }
+
+func TestIPAMBackwardCompatibility(t *testing.T) {
+	ipam, tmpDir := setupTestIPAM(t, "10.244.1.0/24")
+	defer os.RemoveAll(tmpDir)
+
+	// Simulate an older M1 lease file with only containerID and ifName
+	legacyLeasePath := fmt.Sprintf("%s/leases/10.244.1.2", tmpDir)
+	legacyContent := "legacy-container-123\neth0\n"
+	if err := os.WriteFile(legacyLeasePath, []byte(legacyContent), 0644); err != nil {
+		t.Fatalf("failed to write legacy lease: %v", err)
+	}
+
+	// Verify GetLease reads it properly
+	ipNet, err := ipam.GetLease("legacy-container-123")
+	if err != nil {
+		t.Fatalf("failed to get legacy lease: %v", err)
+	}
+	if ipNet.IP.String() != "10.244.1.2" {
+		t.Errorf("expected 10.244.1.2, got %s", ipNet.IP.String())
+	}
+
+	// Verify next allocation skips 10.244.1.2 and gets 10.244.1.3
+	newIP, err := ipam.AllocateWithMetadata("new-container-456", "eth0", "default", "pod-x")
+	if err != nil {
+		t.Fatalf("failed to allocate new IP: %v", err)
+	}
+	if newIP.IP.String() != "10.244.1.3" {
+		t.Errorf("expected 10.244.1.3, got %s", newIP.IP.String())
+	}
+
+	// Verify DetailedLeases returns both
+	detailed, err := ipam.ListDetailedLeases()
+	if err != nil {
+		t.Fatalf("failed to list detailed leases: %v", err)
+	}
+	if len(detailed) != 2 {
+		t.Fatalf("expected 2 detailed leases, got %d", len(detailed))
+	}
+}
+
+func TestIPAMGarbageCollection(t *testing.T) {
+	ipam, tmpDir := setupTestIPAM(t, "10.244.1.0/24")
+	defer os.RemoveAll(tmpDir)
+
+	// Allocate 3 containers
+	ip1, err := ipam.AllocateWithMetadata("live-cid-1", "eth0", "default", "live-pod-1")
+	if err != nil {
+		t.Fatalf("failed alloc 1: %v", err)
+	}
+	ip2, err := ipam.AllocateWithMetadata("live-cid-2", "eth0", "default", "live-pod-2")
+	if err != nil {
+		t.Fatalf("failed alloc 2: %v", err)
+	}
+	ip3, err := ipam.AllocateWithMetadata("crashed-cid-3", "eth0", "default", "dead-pod-3")
+	if err != nil {
+		t.Fatalf("failed alloc 3: %v", err)
+	}
+
+	activePodIPs := map[string]bool{
+		ip1.IP.String(): true,
+	}
+	activeContainerIDs := map[string]bool{
+		"live-cid-2": true,
+	}
+
+	// Run GC with no grace period
+	reclaimed, err := ipam.GC(activePodIPs, activeContainerIDs, 0)
+	if err != nil {
+		t.Fatalf("GC failed: %v", err)
+	}
+
+	if len(reclaimed) != 1 {
+		t.Fatalf("expected 1 reclaimed IP, got %d (%v)", len(reclaimed), reclaimed)
+	}
+	if reclaimed[0] != ip3.IP.String() {
+		t.Errorf("expected %s reclaimed, got %s", ip3.IP.String(), reclaimed[0])
+	}
+
+	// Verify crashed container lease is gone
+	_, err = ipam.GetLease("crashed-cid-3")
+	if !errors.Is(err, ErrLeaseNotFound) {
+		t.Errorf("expected ErrLeaseNotFound for dead container, got %v", err)
+	}
+
+	// Live pods still retain their leases
+	l1, err := ipam.GetLease("live-cid-1")
+	if err != nil || l1.IP.String() != ip1.IP.String() {
+		t.Errorf("live-cid-1 lease lost or corrupted")
+	}
+	l2, err := ipam.GetLease("live-cid-2")
+	if err != nil || l2.IP.String() != ip2.IP.String() {
+		t.Errorf("live-cid-2 lease lost or corrupted")
+	}
+
+	// Test direct ReleaseIP
+	if err := ipam.ReleaseIP(ip2.IP); err != nil {
+		t.Fatalf("ReleaseIP failed: %v", err)
+	}
+	_, err = ipam.GetLease("live-cid-2")
+	if !errors.Is(err, ErrLeaseNotFound) {
+		t.Errorf("expected ErrLeaseNotFound after ReleaseIP, got %v", err)
+	}
+}

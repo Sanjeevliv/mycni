@@ -90,3 +90,23 @@ func TestParseConfigInvalidCIDR(t *testing.T) {
 		t.Fatal("expected error for invalid podCIDR, got nil")
 	}
 }
+
+func TestParseCNIArgs(t *testing.T) {
+	args := "IgnoreUnknown=1;K8S_POD_NAMESPACE=kube-system;K8S_POD_NAME=coredns-xyz;K8S_POD_INFRA_CONTAINER_ID=12345;K8S_POD_UID=uid-abc"
+	meta := ParseCNIArgs(args)
+
+	if meta.PodNamespace != "kube-system" {
+		t.Errorf("expected namespace kube-system, got %s", meta.PodNamespace)
+	}
+	if meta.PodName != "coredns-xyz" {
+		t.Errorf("expected name coredns-xyz, got %s", meta.PodName)
+	}
+	if meta.PodUID != "uid-abc" {
+		t.Errorf("expected uid uid-abc, got %s", meta.PodUID)
+	}
+
+	emptyMeta := ParseCNIArgs("")
+	if emptyMeta.PodName != "" || emptyMeta.PodNamespace != "" {
+		t.Errorf("expected empty metadata for empty string, got %+v", emptyMeta)
+	}
+}

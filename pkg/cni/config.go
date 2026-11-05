@@ -4,9 +4,42 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strings"
 
 	"github.com/containernetworking/cni/pkg/types"
 )
+
+// PodMeta holds Kubernetes pod metadata parsed from CNI_ARGS.
+type PodMeta struct {
+	PodName      string
+	PodNamespace string
+	PodUID       string
+}
+
+// ParseCNIArgs parses the semi-colon delimited CNI_ARGS string provided by the CRI runtime.
+func ParseCNIArgs(args string) *PodMeta {
+	meta := &PodMeta{}
+	if args == "" {
+		return meta
+	}
+	pairs := strings.Split(args, ";")
+	for _, pair := range pairs {
+		kv := strings.SplitN(pair, "=", 2)
+		if len(kv) == 2 {
+			k := strings.TrimSpace(kv[0])
+			v := strings.TrimSpace(kv[1])
+			switch k {
+			case "K8S_POD_NAME":
+				meta.PodName = v
+			case "K8S_POD_NAMESPACE":
+				meta.PodNamespace = v
+			case "K8S_POD_UID":
+				meta.PodUID = v
+			}
+		}
+	}
+	return meta
+}
 
 // PluginConf represents the CNI network configuration for mycni.
 type PluginConf struct {

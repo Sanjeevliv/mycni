@@ -1,8 +1,6 @@
 package ipam
 
 import (
-	"bufio"
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -11,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 )
 
 var (
@@ -19,6 +18,16 @@ var (
 	// ErrLeaseNotFound is returned when looking up a lease that does not exist.
 	ErrLeaseNotFound = errors.New("IPAM lease not found")
 )
+
+// Lease represents an allocated IP lease and its metadata.
+type Lease struct {
+	IP           net.IP    `json:"ip"`
+	ContainerID  string    `json:"containerID"`
+	IfName       string    `json:"ifName"`
+	PodNamespace string    `json:"podNamespace,omitempty"`
+	PodName      string    `json:"podName,omitempty"`
+	AllocatedAt  time.Time `json:"allocatedAt,omitempty"`
+}
 
 // IPAM manages IP address allocation and persistence per node.
 type IPAM struct {
@@ -85,6 +94,11 @@ func (ipam *IPAM) GatewayIPNet() *net.IPNet {
 // Allocate returns an IP address for the container.
 // It is idempotent: if containerID already has a lease, that lease is returned.
 func (ipam *IPAM) Allocate(containerID, ifName string) (*net.IPNet, error) {
+	return ipam.AllocateWithMetadata(containerID, ifName, "", "")
+}
+
+// AllocateWithMetadata returns an IP address for the container along with pod metadata.
+func (ipam *IPAM) AllocateWithMetadata(containerID, ifName, podNamespace, podName string) (*net.IPNet, error) {
 	if containerID == "" {
 		return nil, fmt.Errorf("containerID cannot be empty")
 	}
@@ -108,13 +122,20 @@ func (ipam *IPAM) Allocate(containerID, ifName string) (*net.IPNet, error) {
 			return fmt.Errorf("CIDR %v too small for allocation", ipam.podCIDR)
 		}
 
+		now := time.Now().UTC().Format(time.RFC3339)
 		for cur := startIP; cur <= endIP; cur++ {
 			candidateIP := uint32ToIP(cur)
 			leasePath := filepath.Join(ipam.leaseDir, candidateIP.String())
 
 			if _, err := os.Stat(leasePath); os.IsNotExist(err) {
 				// Free IP found, claim it
-				content := fmt.Sprintf("%s\n%s\n", containerID, ifName)
+				content := fmt.Sprintf("%s\n%s\n%s\n%s\n%s\n",
+					containerID,
+					ifName,
+					podNamespace,
+					podName,
+					now,
+				)
 				if err := os.WriteFile(leasePath, []byte(content), 0644); err != nil {
 					return fmt.Errorf("failed to write lease file %q: %w", leasePath, err)
 				}
@@ -163,12 +184,27 @@ func (ipam *IPAM) Release(containerID, ifName string) error {
 				continue
 			}
 
-			cid := readContainerID(data)
-			if cid == containerID {
+			lease := parseLeaseData(net.ParseIP(entry.Name()), data)
+			if lease.ContainerID == containerID {
 				_ = os.Remove(leasePath)
 			}
 		}
 
+		return nil
+	})
+}
+
+// ReleaseIP frees a specific IP lease directly.
+func (ipam *IPAM) ReleaseIP(ip net.IP) error {
+	if ip == nil {
+		return nil
+	}
+
+	return ipam.withLock(func() error {
+		leasePath := filepath.Join(ipam.leaseDir, ip.String())
+		if err := os.Remove(leasePath); err != nil && !os.IsNotExist(err) {
+			return err
+		}
 		return nil
 	})
 }
@@ -210,14 +246,105 @@ func (ipam *IPAM) ListLeases() (map[string]string, error) {
 			if err != nil {
 				continue
 			}
-			cid := readContainerID(data)
-			if cid != "" {
-				leases[entry.Name()] = cid
+			lease := parseLeaseData(net.ParseIP(entry.Name()), data)
+			if lease.ContainerID != "" {
+				leases[entry.Name()] = lease.ContainerID
 			}
 		}
 		return nil
 	})
 	return leases, err
+}
+
+// ListDetailedLeases returns all active leases with their parsed metadata.
+func (ipam *IPAM) ListDetailedLeases() ([]Lease, error) {
+	var leases []Lease
+	err := ipam.withLock(func() error {
+		entries, err := os.ReadDir(ipam.leaseDir)
+		if err != nil {
+			return err
+		}
+
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			ip := net.ParseIP(entry.Name())
+			if ip == nil {
+				continue
+			}
+
+			data, err := os.ReadFile(filepath.Join(ipam.leaseDir, entry.Name()))
+			if err != nil {
+				continue
+			}
+			lease := parseLeaseData(ip, data)
+			leases = append(leases, lease)
+		}
+		return nil
+	})
+	return leases, err
+}
+
+// GC reconciles stored IPAM lease files against active pods on the node.
+// It removes any lease whose IP is not in activePodIPs AND whose ContainerID is not in activeContainerIDs.
+// If gracePeriod > 0, leases created within the grace window are spared to allow pod startups to complete.
+func (ipam *IPAM) GC(activePodIPs map[string]bool, activeContainerIDs map[string]bool, gracePeriod time.Duration) ([]string, error) {
+	var reclaimed []string
+	err := ipam.withLock(func() error {
+		entries, err := os.ReadDir(ipam.leaseDir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+
+		now := time.Now()
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+
+			ipStr := entry.Name()
+			ip := net.ParseIP(ipStr)
+			if ip == nil {
+				continue
+			}
+
+			leasePath := filepath.Join(ipam.leaseDir, ipStr)
+			data, err := os.ReadFile(leasePath)
+			if err != nil {
+				continue
+			}
+
+			lease := parseLeaseData(ip, data)
+
+			// Honor grace period for freshly allocated leases
+			if gracePeriod > 0 && !lease.AllocatedAt.IsZero() {
+				if now.Sub(lease.AllocatedAt) < gracePeriod {
+					continue
+				}
+			}
+
+			isActive := false
+			if activePodIPs != nil && activePodIPs[ipStr] {
+				isActive = true
+			}
+			if activeContainerIDs != nil && activeContainerIDs[lease.ContainerID] {
+				isActive = true
+			}
+
+			// If neither IP nor containerID matches an active pod, reclaim lease
+			if !isActive {
+				if err := os.Remove(leasePath); err == nil {
+					reclaimed = append(reclaimed, ipStr)
+				}
+			}
+		}
+		return nil
+	})
+	return reclaimed, err
 }
 
 func (ipam *IPAM) findContainerLease(containerID string) (net.IP, error) {
@@ -234,22 +361,35 @@ func (ipam *IPAM) findContainerLease(containerID string) (net.IP, error) {
 		if err != nil {
 			continue
 		}
-		if readContainerID(data) == containerID {
-			ip := net.ParseIP(entry.Name())
-			if ip != nil {
-				return ip, nil
-			}
+		lease := parseLeaseData(net.ParseIP(entry.Name()), data)
+		if lease.ContainerID == containerID {
+			return lease.IP, nil
 		}
 	}
 	return nil, ErrLeaseNotFound
 }
 
-func readContainerID(data []byte) string {
-	scanner := bufio.NewScanner(bytes.NewReader(data))
-	if scanner.Scan() {
-		return strings.TrimSpace(scanner.Text())
+func parseLeaseData(ip net.IP, data []byte) Lease {
+	lease := Lease{IP: ip}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) > 0 {
+		lease.ContainerID = strings.TrimSpace(lines[0])
 	}
-	return ""
+	if len(lines) > 1 {
+		lease.IfName = strings.TrimSpace(lines[1])
+	}
+	if len(lines) > 2 {
+		lease.PodNamespace = strings.TrimSpace(lines[2])
+	}
+	if len(lines) > 3 {
+		lease.PodName = strings.TrimSpace(lines[3])
+	}
+	if len(lines) > 4 {
+		if t, err := time.Parse(time.RFC3339, strings.TrimSpace(lines[4])); err == nil {
+			lease.AllocatedAt = t
+		}
+	}
+	return lease
 }
 
 func cidrBounds(ipnet *net.IPNet) (netUint, bcastUint uint32) {
