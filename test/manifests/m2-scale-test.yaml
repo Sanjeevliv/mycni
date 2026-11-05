@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: m2-scale-test
+  namespace: default
+  labels:
+    app: m2-scale-test
+spec:
+  replicas: 30
+  selector:
+    matchLabels:
+      app: m2-scale-test
+  template:
+    metadata:
+      labels:
+        app: m2-scale-test
+    spec:
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.9
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "16Mi"
+            limits:
+              cpu: "50m"
+              memory: "32Mi"
+
