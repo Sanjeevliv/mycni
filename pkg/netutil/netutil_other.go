@@ -45,3 +45,8 @@ func EnableBridgeNetfilter() error {
 func EnsureMasquerade(podCIDR string, clusterCIDR string) error {
 	return nil
 }
+
+// EnsureForwardRules stub for non-linux systems.
+func EnsureForwardRules(clusterCIDR string) error {
+	return nil
+}
