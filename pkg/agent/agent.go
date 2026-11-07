@@ -12,48 +12,58 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/cache"
 
 	"github.com/sanjeevliv/mycni/pkg/ipam"
 	"github.com/sanjeevliv/mycni/pkg/netutil"
+	"github.com/sanjeevliv/mycni/pkg/routing"
+	"github.com/sanjeevliv/mycni/pkg/routing/direct"
 )
 
 // Config holds the configuration options for the mycni-agent node daemon.
 type Config struct {
-	NodeName    string
-	PodCIDR     string
-	ClusterCIDR string
-	BridgeName  string
-	MTU         int
-	CNIBinSrc   string
-	CNIBinDir   string
-	CNIConfDir  string
-	CNIDataDir  string
-	SyncPeriod  time.Duration
+	NodeName       string
+	NodeIP         string
+	PodCIDR        string
+	ClusterCIDR    string
+	BridgeName     string
+	MTU            int
+	RoutingBackend string
+	CNIBinSrc      string
+	CNIBinDir      string
+	CNIConfDir     string
+	CNIDataDir     string
+	SyncPeriod     time.Duration
 }
 
 // DefaultConfig returns a Config with production defaults.
 func DefaultConfig() Config {
 	return Config{
-		ClusterCIDR: "10.244.0.0/16",
-		BridgeName:  "mycni0",
-		MTU:         1500,
-		CNIBinSrc:   "/bin/mycni-cni",
-		CNIBinDir:   "/host/opt/cni/bin",
-		CNIConfDir:  "/host/etc/cni/net.d",
-		CNIDataDir:  "/var/lib/cni/mycni",
-		SyncPeriod:  30 * time.Second,
+		ClusterCIDR:    "10.244.0.0/16",
+		BridgeName:     "mycni0",
+		MTU:            1500,
+		RoutingBackend: "direct",
+		CNIBinSrc:      "/bin/mycni-cni",
+		CNIBinDir:      "/host/opt/cni/bin",
+		CNIConfDir:     "/host/etc/cni/net.d",
+		CNIDataDir:     "/var/lib/cni/mycni",
+		SyncPeriod:     30 * time.Second,
 	}
 }
 
 // Agent coordinates automated node bootstrapping, dataplane initialization,
-// and IPAM lease reconciliation.
+// peer route programming, and IPAM lease reconciliation.
 type Agent struct {
 	cfg       Config
 	k8sClient kubernetes.Interface
 	logger    *slog.Logger
 	ipam      *ipam.IPAM
+	backend   routing.Backend
+	localNode routing.NodeInfo
 }
 
 // New creates a new Agent instance.
@@ -73,15 +83,32 @@ func New(cfg Config, client kubernetes.Interface, logger *slog.Logger) (*Agent, 
 	if cfg.ClusterCIDR == "" {
 		cfg.ClusterCIDR = "10.244.0.0/16"
 	}
+	if cfg.RoutingBackend == "" {
+		cfg.RoutingBackend = "direct"
+	}
 	if logger == nil {
 		logger = slog.Default()
+	}
+
+	var backend routing.Backend
+	switch cfg.RoutingBackend {
+	case "direct":
+		backend = direct.New(logger)
+	default:
+		return nil, fmt.Errorf("unsupported routing backend %q", cfg.RoutingBackend)
 	}
 
 	return &Agent{
 		cfg:       cfg,
 		k8sClient: client,
 		logger:    logger,
+		backend:   backend,
 	}, nil
+}
+
+// SetBackend overrides the routing backend (used in unit tests).
+func (a *Agent) SetBackend(b routing.Backend) {
+	a.backend = b
 }
 
 // InstallCNIBinary atomically copies the CNI plugin executable to the host directory.
@@ -162,25 +189,30 @@ func (a *Agent) RenderCNIConfig() error {
 	return nil
 }
 
-// FetchPodCIDR queries the Kubernetes API for this node to obtain the assigned podCIDR.
+// FetchPodCIDR queries the Kubernetes API for this node to obtain the assigned podCIDR and InternalIP.
 func (a *Agent) FetchPodCIDR(ctx context.Context) (string, error) {
-	if a.cfg.PodCIDR != "" {
-		return a.cfg.PodCIDR, nil
-	}
-
 	if a.k8sClient == nil {
+		if a.cfg.PodCIDR != "" {
+			return a.cfg.PodCIDR, nil
+		}
 		return "", fmt.Errorf("kubernetes client is required to fetch node podCIDR")
 	}
 
 	a.logger.Info("querying Kubernetes API for node spec.podCIDR", "node", a.cfg.NodeName)
 	node, err := a.k8sClient.CoreV1().Nodes().Get(ctx, a.cfg.NodeName, metav1.GetOptions{})
 	if err != nil {
+		if a.cfg.PodCIDR != "" {
+			return a.cfg.PodCIDR, nil
+		}
 		return "", fmt.Errorf("failed to get node %q: %w", a.cfg.NodeName, err)
 	}
 
-	podCIDR := node.Spec.PodCIDR
-	if podCIDR == "" && len(node.Spec.PodCIDRs) > 0 {
-		podCIDR = node.Spec.PodCIDRs[0]
+	podCIDR := a.cfg.PodCIDR
+	if podCIDR == "" {
+		podCIDR = node.Spec.PodCIDR
+		if podCIDR == "" && len(node.Spec.PodCIDRs) > 0 {
+			podCIDR = node.Spec.PodCIDRs[0]
+		}
 	}
 
 	if podCIDR == "" {
@@ -188,10 +220,26 @@ func (a *Agent) FetchPodCIDR(ctx context.Context) (string, error) {
 	}
 
 	a.cfg.PodCIDR = podCIDR
+
+	if info, ok := routing.ExtractNodeInfo(node); ok {
+		a.localNode = info
+	} else {
+		_, podNet, _ := net.ParseCIDR(podCIDR)
+		var nodeIP net.IP
+		if a.cfg.NodeIP != "" {
+			nodeIP = net.ParseIP(a.cfg.NodeIP)
+		}
+		a.localNode = routing.NodeInfo{
+			Name:    a.cfg.NodeName,
+			NodeIP:  nodeIP,
+			PodCIDR: podNet,
+		}
+	}
+
 	return podCIDR, nil
 }
 
-// InitDataplane configures kernel sysctls, bridge interface, and iptables MASQUERADE.
+// InitDataplane configures kernel sysctls, bridge interface, iptables rules, and routing backend.
 func (a *Agent) InitDataplane() error {
 	// 1. Enable sysctls
 	if err := netutil.EnableIPForward(); err != nil {
@@ -206,6 +254,7 @@ func (a *Agent) InitDataplane() error {
 	if err != nil {
 		return fmt.Errorf("invalid podCIDR %q: %w", a.cfg.PodCIDR, err)
 	}
+	podIPNet.IP = podIPNet.IP.Mask(podIPNet.Mask).To4()
 
 	// 3. Initialize IPAM
 	ipamInstance, err := ipam.New(a.cfg.CNIDataDir, podIPNet)
@@ -221,14 +270,162 @@ func (a *Agent) InitDataplane() error {
 	}
 	a.logger.Info("ensured host bridge", "bridge", bridge.Attrs().Name, "gateway", ipamInstance.GetGatewayIP().String())
 
-	// 5. Ensure iptables MASQUERADE NAT rule
+	// 5. Ensure iptables MASQUERADE NAT and FORWARD rules
 	if err := netutil.EnsureMasquerade(a.cfg.PodCIDR, a.cfg.ClusterCIDR); err != nil {
 		a.logger.Warn("failed to configure iptables MASQUERADE rule", "error", err)
 	} else {
 		a.logger.Info("ensured outbound NAT MASQUERADE rule", "podCIDR", a.cfg.PodCIDR, "clusterCIDR", a.cfg.ClusterCIDR)
 	}
+	if err := netutil.EnsureForwardRules(a.cfg.ClusterCIDR); err != nil {
+		a.logger.Warn("failed to configure iptables FORWARD rules", "error", err)
+	}
+
+	// 6. Initialize cross-node routing backend
+	if a.backend != nil {
+		if a.localNode.PodCIDR == nil {
+			a.localNode.PodCIDR = podIPNet
+		}
+		if a.localNode.Name == "" {
+			a.localNode.Name = a.cfg.NodeName
+		}
+		if a.localNode.NodeIP != nil {
+			if err := a.backend.Init(a.localNode); err != nil {
+				return fmt.Errorf("failed to initialize %s routing backend: %w", a.backend.Name(), err)
+			}
+		}
+	}
 
 	return nil
+}
+
+// HandleNodeAddOrUpdate processes a v1.Node Add or Update event from the SharedInformer.
+func (a *Agent) HandleNodeAddOrUpdate(node *corev1.Node) {
+	if a.backend == nil || node == nil || node.Name == a.cfg.NodeName {
+		return
+	}
+
+	peerInfo, ok := routing.ExtractNodeInfo(node)
+	if !ok {
+		return
+	}
+
+	if err := a.backend.AddPeer(peerInfo); err != nil {
+		a.logger.Error("failed to program route for peer node",
+			"peer", peerInfo.Name,
+			"podCIDR", peerInfo.PodCIDR.String(),
+			"nodeIP", peerInfo.NodeIP.String(),
+			"error", err,
+		)
+	}
+}
+
+// HandleNodeDelete processes a v1.Node Delete event from the SharedInformer.
+func (a *Agent) HandleNodeDelete(node *corev1.Node) {
+	if a.backend == nil || node == nil || node.Name == a.cfg.NodeName {
+		return
+	}
+
+	peerInfo, ok := routing.ExtractNodeInfo(node)
+	if !ok {
+		// Even if NodeIP is missing on delete, attempt to parse PodCIDR so the route is removed
+		cidrStr := node.Spec.PodCIDR
+		if cidrStr == "" && len(node.Spec.PodCIDRs) > 0 {
+			cidrStr = node.Spec.PodCIDRs[0]
+		}
+		_, podCIDR, err := net.ParseCIDR(cidrStr)
+		if err != nil || podCIDR == nil {
+			return
+		}
+		podCIDR.IP = podCIDR.IP.Mask(podCIDR.Mask).To4()
+		peerInfo = routing.NodeInfo{
+			Name:    node.Name,
+			PodCIDR: podCIDR,
+		}
+	}
+
+	if err := a.backend.RemovePeer(peerInfo); err != nil {
+		a.logger.Error("failed to remove route for deleted peer node",
+			"peer", peerInfo.Name,
+			"podCIDR", peerInfo.PodCIDR.String(),
+			"error", err,
+		)
+	}
+}
+
+// ReconcileRoutes queries all live cluster nodes and reconciles kernel proto-77 routes.
+func (a *Agent) ReconcileRoutes(ctx context.Context) error {
+	if a.backend == nil || a.k8sClient == nil {
+		return nil
+	}
+
+	nodes, err := a.k8sClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to list cluster nodes for route reconciliation: %w", err)
+	}
+
+	var peers []routing.NodeInfo
+	for i := range nodes.Items {
+		node := &nodes.Items[i]
+		if node.Name == a.cfg.NodeName {
+			continue
+		}
+		if info, ok := routing.ExtractNodeInfo(node); ok {
+			peers = append(peers, info)
+		}
+	}
+
+	return a.backend.Reconcile(peers)
+}
+
+// StartNodeWatcher starts a client-go SharedInformer watching v1.Node events.
+func (a *Agent) StartNodeWatcher(ctx context.Context) error {
+	if a.k8sClient == nil || a.backend == nil {
+		return nil
+	}
+
+	factory := informers.NewSharedInformerFactory(a.k8sClient, a.cfg.SyncPeriod)
+	nodeInformer := factory.Core().V1().Nodes().Informer()
+
+	_, err := nodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			if node, ok := extractNodeObject(obj); ok {
+				a.HandleNodeAddOrUpdate(node)
+			}
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			if node, ok := extractNodeObject(newObj); ok {
+				a.HandleNodeAddOrUpdate(node)
+			}
+		},
+		DeleteFunc: func(obj interface{}) {
+			if node, ok := extractNodeObject(obj); ok {
+				a.HandleNodeDelete(node)
+			}
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to register node informer event handler: %w", err)
+	}
+
+	factory.Start(ctx.Done())
+	if !cache.WaitForCacheSync(ctx.Done(), nodeInformer.HasSynced) {
+		return fmt.Errorf("timed out waiting for node informer cache to sync")
+	}
+
+	a.logger.Info("started Kubernetes Node SharedInformer watcher", "backend", a.backend.Name())
+	return nil
+}
+
+func extractNodeObject(obj interface{}) (*corev1.Node, bool) {
+	if node, ok := obj.(*corev1.Node); ok {
+		return node, true
+	}
+	tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+	if !ok {
+		return nil, false
+	}
+	node, ok := tombstone.Obj.(*corev1.Node)
+	return node, ok
 }
 
 // ReconcileLeases synchronizes IPAM leases on disk with currently active pods.
@@ -278,7 +475,7 @@ func (a *Agent) ReconcileLeases(ctx context.Context) error {
 
 // Bootstrap runs the initial startup sequence.
 func (a *Agent) Bootstrap(ctx context.Context) error {
-	a.logger.Info("starting mycni-agent node bootstrapping", "node", a.cfg.NodeName)
+	a.logger.Info("starting mycni-agent node bootstrapping", "node", a.cfg.NodeName, "backend", a.cfg.RoutingBackend)
 
 	// Step 1: Discover or wait for podCIDR
 	for {
@@ -305,12 +502,17 @@ func (a *Agent) Bootstrap(ctx context.Context) error {
 		return fmt.Errorf("failed to render CNI config: %w", err)
 	}
 
-	// Step 4: Initialize dataplane (bridge, sysctls, iptables)
+	// Step 4: Initialize dataplane (bridge, sysctls, iptables, routing backend)
 	if err := a.InitDataplane(); err != nil {
 		return fmt.Errorf("failed to initialize dataplane: %w", err)
 	}
 
-	// Step 5: Startup IPAM lease reconciliation
+	// Step 5: Startup route reconciliation
+	if err := a.ReconcileRoutes(ctx); err != nil {
+		a.logger.Warn("initial route reconciliation warning", "error", err)
+	}
+
+	// Step 6: Startup IPAM lease reconciliation
 	if err := a.ReconcileLeases(ctx); err != nil {
 		a.logger.Warn("initial IPAM reconciliation warning", "error", err)
 	}
@@ -325,6 +527,10 @@ func (a *Agent) Run(ctx context.Context) error {
 		return err
 	}
 
+	if err := a.StartNodeWatcher(ctx); err != nil {
+		return fmt.Errorf("failed to start node watcher: %w", err)
+	}
+
 	ticker := time.NewTicker(a.cfg.SyncPeriod)
 	defer ticker.Stop()
 
@@ -336,16 +542,21 @@ func (a *Agent) Run(ctx context.Context) error {
 			a.logger.Info("shutting down mycni-agent (pod connectivity preserved)")
 			return nil
 		case <-ticker.C:
-			// Refresh sysctls and NAT rules
+			// Refresh sysctls and NAT/FORWARD rules
 			_ = netutil.EnableIPForward()
 			_ = netutil.EnableBridgeNetfilter()
 			_ = netutil.EnsureMasquerade(a.cfg.PodCIDR, a.cfg.ClusterCIDR)
+			_ = netutil.EnsureForwardRules(a.cfg.ClusterCIDR)
 
-			// Reconcile IPAM
+			// Reconcile peer routes (proto 77)
+			if err := a.ReconcileRoutes(ctx); err != nil {
+				a.logger.Warn("periodic route reconciliation error", "error", err)
+			}
+
+			// Reconcile IPAM leases
 			if err := a.ReconcileLeases(ctx); err != nil {
 				a.logger.Warn("periodic IPAM reconciliation error", "error", err)
 			}
 		}
 	}
 }
-

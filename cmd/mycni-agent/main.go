@@ -21,17 +21,18 @@ import (
 
 func main() {
 	var (
-		nodeName    string
-		podCIDR     string
-		clusterCIDR string
-		bridgeName  string
-		mtu         int
-		cniBinSrc   string
-		cniBinDir   string
-		cniConfDir  string
-		cniDataDir  string
-		kubeconfig  string
-		syncPeriod  time.Duration
+		nodeName       string
+		podCIDR        string
+		clusterCIDR    string
+		bridgeName     string
+		mtu            int
+		routingBackend string
+		cniBinSrc      string
+		cniBinDir      string
+		cniConfDir     string
+		cniDataDir     string
+		kubeconfig     string
+		syncPeriod     time.Duration
 	)
 
 	defaultKubeconfig := os.Getenv("KUBECONFIG")
@@ -46,6 +47,7 @@ func main() {
 	flag.StringVar(&clusterCIDR, "cluster-cidr", getEnvOrDefault("CLUSTER_CIDR", "10.244.0.0/16"), "Cluster-wide Pod CIDR for NAT masquerade")
 	flag.StringVar(&bridgeName, "bridge", "mycni0", "Bridge interface name")
 	flag.IntVar(&mtu, "mtu", 1500, "MTU for bridge and pod veth interfaces")
+	flag.StringVar(&routingBackend, "backend", getEnvOrDefault("ROUTING_BACKEND", "direct"), "Cross-node routing backend (direct, vxlan)")
 	flag.StringVar(&cniBinSrc, "cni-bin-src", getEnvOrDefault("CNI_BIN_SRC", "/bin/mycni-cni"), "Source path of mycni-cni binary to install")
 	flag.StringVar(&cniBinDir, "cni-bin-dir", getEnvOrDefault("CNI_BIN_DIR", "/host/opt/cni/bin"), "Target host directory for CNI binaries")
 	flag.StringVar(&cniConfDir, "cni-conf-dir", getEnvOrDefault("CNI_CONF_DIR", "/host/etc/cni/net.d"), "Target host directory for CNI configs")
@@ -71,16 +73,17 @@ func main() {
 
 	// 2. Initialize Agent
 	cfg := agent.Config{
-		NodeName:    nodeName,
-		PodCIDR:     podCIDR,
-		ClusterCIDR: clusterCIDR,
-		BridgeName:  bridgeName,
-		MTU:         mtu,
-		CNIBinSrc:   cniBinSrc,
-		CNIBinDir:   cniBinDir,
-		CNIConfDir:  cniConfDir,
-		CNIDataDir:  cniDataDir,
-		SyncPeriod:  syncPeriod,
+		NodeName:       nodeName,
+		PodCIDR:        podCIDR,
+		ClusterCIDR:    clusterCIDR,
+		BridgeName:     bridgeName,
+		MTU:            mtu,
+		RoutingBackend: routingBackend,
+		CNIBinSrc:      cniBinSrc,
+		CNIBinDir:      cniBinDir,
+		CNIConfDir:     cniConfDir,
+		CNIDataDir:     cniDataDir,
+		SyncPeriod:     syncPeriod,
 	}
 
 	nodeAgent, err := agent.New(cfg, k8sClient, logger)
@@ -93,7 +96,7 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	logger.Info("starting mycni-agent daemon", "node", nodeName, "version", "v0.1.0-m2")
+	logger.Info("starting mycni-agent daemon", "node", nodeName, "backend", routingBackend, "version", "v0.1.0")
 	if err := nodeAgent.Run(ctx); err != nil && err != context.Canceled {
 		logger.Error("agent failed", "error", err)
 		os.Exit(1)

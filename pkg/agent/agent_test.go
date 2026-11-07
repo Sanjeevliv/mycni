@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/sanjeevliv/mycni/pkg/ipam"
+	"github.com/sanjeevliv/mycni/pkg/routing"
 )
 
 func TestInstallCNIBinary(t *testing.T) {
@@ -204,6 +206,111 @@ func TestReconcileLeases(t *testing.T) {
 	}
 	if _, ok := remaining[ip1.IP.String()]; !ok {
 		t.Errorf("expected active pod lease %s to remain", ip1.IP.String())
+	}
+}
+
+type mockRoutingBackend struct {
+	mu           sync.Mutex
+	peers        map[string]routing.NodeInfo
+	reconciled   []routing.NodeInfo
+	reconcileCnt int
+}
+
+func newMockRoutingBackend() *mockRoutingBackend {
+	return &mockRoutingBackend{
+		peers: make(map[string]routing.NodeInfo),
+	}
+}
+
+func (m *mockRoutingBackend) Name() string {
+	return "mock"
+}
+
+func (m *mockRoutingBackend) Init(local routing.NodeInfo) error {
+	return nil
+}
+
+func (m *mockRoutingBackend) AddPeer(peer routing.NodeInfo) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.peers[peer.PodCIDR.String()] = peer
+	return nil
+}
+
+func (m *mockRoutingBackend) RemovePeer(peer routing.NodeInfo) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.peers, peer.PodCIDR.String())
+	return nil
+}
+
+func (m *mockRoutingBackend) Reconcile(peers []routing.NodeInfo) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.reconciled = peers
+	m.reconcileCnt++
+	return nil
+}
+
+func TestAgentNodeEventsAndReconcileRoutes(t *testing.T) {
+	localNode := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "mycni-worker"},
+		Spec:       corev1.NodeSpec{PodCIDR: "10.244.1.0/24"},
+		Status: corev1.NodeStatus{
+			Addresses: []corev1.NodeAddress{
+				{Type: corev1.NodeInternalIP, Address: "172.18.0.3"},
+			},
+		},
+	}
+	peerNode := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "mycni-worker2"},
+		Spec:       corev1.NodeSpec{PodCIDR: "10.244.2.0/24"},
+		Status: corev1.NodeStatus{
+			Addresses: []corev1.NodeAddress{
+				{Type: corev1.NodeInternalIP, Address: "172.18.0.2"},
+			},
+		},
+	}
+
+	fakeClient := fake.NewSimpleClientset(localNode, peerNode)
+	cfg := Config{
+		NodeName: "mycni-worker",
+	}
+
+	ag, err := New(cfg, fakeClient, nil)
+	if err != nil {
+		t.Fatalf("failed to create agent: %v", err)
+	}
+	mockBackend := newMockRoutingBackend()
+	ag.SetBackend(mockBackend)
+
+	// Self events should be ignored
+	ag.HandleNodeAddOrUpdate(localNode)
+	if len(mockBackend.peers) != 0 {
+		t.Fatalf("expected 0 peers after self event, got %d", len(mockBackend.peers))
+	}
+
+	// Peer add event should program peer route
+	ag.HandleNodeAddOrUpdate(peerNode)
+	if len(mockBackend.peers) != 1 {
+		t.Fatalf("expected 1 peer after peer add event, got %d", len(mockBackend.peers))
+	}
+	if mockBackend.peers["10.244.2.0/24"].NodeIP.String() != "172.18.0.2" {
+		t.Errorf("unexpected peer NodeIP: %s", mockBackend.peers["10.244.2.0/24"].NodeIP.String())
+	}
+
+	// Periodic ReconcileRoutes should pass live peers to backend.Reconcile
+	if err := ag.ReconcileRoutes(context.Background()); err != nil {
+		t.Fatalf("ReconcileRoutes failed: %v", err)
+	}
+	if mockBackend.reconcileCnt != 1 || len(mockBackend.reconciled) != 1 {
+		t.Errorf("expected 1 reconciled peer, got %d (count=%d)", len(mockBackend.reconciled), mockBackend.reconcileCnt)
+	}
+
+	// Peer delete event should remove peer route
+	ag.HandleNodeDelete(peerNode)
+	if len(mockBackend.peers) != 0 {
+		t.Errorf("expected peer route to be removed on node delete, got %d", len(mockBackend.peers))
 	}
 }
 
