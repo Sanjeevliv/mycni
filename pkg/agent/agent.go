@@ -12,11 +12,15 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/cache"
 
 	"github.com/sanjeevliv/mycni/pkg/ipam"
 	"github.com/sanjeevliv/mycni/pkg/netutil"
+	"github.com/sanjeevliv/mycni/pkg/routing"
 )
 
 // Config holds the configuration options for the mycni-agent node daemon.
@@ -227,7 +231,40 @@ func (a *Agent) InitDataplane() error {
 	} else {
 		a.logger.Info("ensured outbound NAT MASQUERADE rule", "podCIDR", a.cfg.PodCIDR, "clusterCIDR", a.cfg.ClusterCIDR)
 	}
+	_ = netutil.EnsureForwardRules(a.cfg.ClusterCIDR)
 
+	return nil
+}
+
+// WatchNodes programs direct routes when peer nodes join the cluster.
+func (a *Agent) WatchNodes(ctx context.Context) error {
+	if a.k8sClient == nil {
+		return nil
+	}
+	factory := informers.NewSharedInformerFactory(a.k8sClient, a.cfg.SyncPeriod)
+	informer := factory.Core().V1().Nodes().Informer()
+
+	_, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			if node, ok := obj.(*corev1.Node); ok && node.Name != a.cfg.NodeName {
+				if peer, ok := routing.ExtractNodeInfo(node); ok {
+					_ = routing.EnsureDirectRoute(1, peer.PodCIDR, peer.NodeIP)
+				}
+			}
+		},
+		DeleteFunc: func(obj interface{}) {
+			if node, ok := obj.(*corev1.Node); ok && node.Name != a.cfg.NodeName {
+				if peer, ok := routing.ExtractNodeInfo(node); ok {
+					_ = routing.DeleteDirectRoute(peer.PodCIDR)
+				}
+			}
+		},
+	})
+	if err != nil {
+		return err
+	}
+	factory.Start(ctx.Done())
+	cache.WaitForCacheSync(ctx.Done(), informer.HasSynced)
 	return nil
 }
 
@@ -324,6 +361,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	if err := a.Bootstrap(ctx); err != nil {
 		return err
 	}
+	_ = a.WatchNodes(ctx)
 
 	ticker := time.NewTicker(a.cfg.SyncPeriod)
 	defer ticker.Stop()

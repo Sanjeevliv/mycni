@@ -155,6 +155,9 @@ func SetupPodVeth(netnsPath string, ifName string, mtu int, bridge *netlink.Brid
 		return nil, "", fmt.Errorf("failed to attach host veth %q to bridge %q: %w", hostIfaceName, bridge.Name, err)
 	}
 
+	// Enable hairpin mode on bridge port so pods can reach ClusterIP services backed by themselves
+	_ = netlink.LinkSetHairpin(hLink, true)
+
 	if err := netlink.LinkSetUp(hLink); err != nil {
 		return nil, "", fmt.Errorf("failed to set host veth %q UP: %w", hostIfaceName, err)
 	}
@@ -243,4 +246,17 @@ func EnsureMasquerade(podCIDR string, clusterCIDR string) error {
 
 	rule := []string{"-s", podCIDR, "!", "-d", clusterCIDR, "-j", "MASQUERADE"}
 	return ipt.AppendUnique("nat", "POSTROUTING", rule...)
+}
+
+// EnsureForwardRules ensures the filter/FORWARD chain permits pod traffic across the cluster CIDR.
+func EnsureForwardRules(clusterCIDR string) error {
+	ipt, err := iptables.New()
+	if err != nil {
+		return fmt.Errorf("failed to initialize iptables: %w", err)
+	}
+
+	if err := ipt.AppendUnique("filter", "FORWARD", "-s", clusterCIDR, "-j", "ACCEPT"); err != nil {
+		return err
+	}
+	return ipt.AppendUnique("filter", "FORWARD", "-d", clusterCIDR, "-j", "ACCEPT")
 }
