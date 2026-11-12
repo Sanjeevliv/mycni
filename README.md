@@ -27,6 +27,10 @@
   - High concurrency stress test passed: 30-replica Deployment verified with 30 unique IPs (0 collisions) and 100% clean lease reclamation on scale-down.
   - Zero-downtime rolling restarts verified: active pods and CoreDNS continue running without packet drops.
   - Walkthrough and interview guide: [`M2.md`](file:///Users/sanjeev/Desktop/mycni/M2.md).
+- [x] **M3: Cross-Node Connectivity — Direct Routing**
+  - Dynamic route controller in `mycni-agent` watching Kubernetes `Node` events.
+  - Direct L3 host routes (`proto 77`) via Netlink across all cluster nodes.
+  - E2E cross-node connectivity test suite verified via `make e2e`.
 
 ---
 

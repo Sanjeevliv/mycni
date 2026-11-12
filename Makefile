@@ -8,7 +8,7 @@ AGENT_BIN := $(BIN_DIR)/mycni-agent
 IMAGE_NAME ?= mycni:latest
 CLUSTER_NAME ?= mycni
 
-.PHONY: all build build-cni build-agent test image kind-load deploy redeploy logs test-scale clean install-worker
+.PHONY: all build build-cni build-agent test image kind-load deploy redeploy logs e2e test-scale clean install-worker
 
 all: build
 
@@ -40,6 +40,9 @@ redeploy: image kind-load
 
 logs:
 	kubectl -n kube-system logs -l k8s-app=mycni --tail=100 -f
+
+e2e:
+	bash ./test/e2e/e2e.sh
 
 test-scale:
 	kubectl apply -f test/manifests/m2-scale-test.yaml
